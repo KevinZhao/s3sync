@@ -1,330 +1,615 @@
-# S3 Sync Automation Scripts
+# S3 到 S3 Express One Zone 同步方案
 
-自动化配置脚本，用于从京东云通过 DX + TGW 私网上传到 AWS S3，并自动同步到 S3 Express One Zone。
+标准桶作为唯一数据源，自动同步到 S3 Express One Zone 桶（单向同步）。
 
-## 架构概述
+## 重要背景
 
-### Phase 1: 京东云 → 标准 S3 桶
-- 京东云 IDC → Direct Connect → Frankfurt DXGW → Transit VIF → eu-north-1 TGW → 业务 VPC
-- S3 Interface Endpoint（私网访问）
-- Route 53 Resolver Inbound Endpoint（DNS 解析）
+- S3 Express One Zone（Directory Bucket）**不支持** S3 Event Notifications / Replication / Versioning
+- 事件必须从标准桶发出，Worker 负责操作 Express 桶
+- CopyObject 单次最多 5GB，大文件使用 multipart copy（UploadPartCopy）
+- 删除事件：如果源桶开启 Versioning，需监听 `DeleteMarkerCreated`
 
-### Phase 2: 标准 S3 桶 → S3 Express One Zone
-- Lambda 函数监听 S3 事件
-- 自动将新上传文件同步到 S3 Express 目录桶
+## 方案特点
 
-## 前置要求
+**架构**：S3 → SQS → Lambda Starter（定时检查）→ ECS Fargate Spot Worker
 
-1. **AWS 环境**
-   - 已配置好的 VPC（在 eu-north-1）
-   - 至少 2 个私网子网（跨 AZ）
-   - Transit Gateway 已连接
-   - **S3 Express One Zone 目录桶已创建**（必须）
-   - S3 标准桶（可选，可通过脚本自动创建或使用已存在的）
+**特点**：
+- ✅ 真正按需，无消息时零成本（Lambda + Fargate Spot 都按使用量计费）
+- ✅ 定时触发（1-5 分钟检查间隔，可配置）
+- ✅ Fargate Spot 节省 70% 成本（自动 80/20 混合策略）
+- ✅ Lambda Starter 轻量调度（检查队列深度 → 按需启动 Worker）
+- ✅ Worker 自动关闭（3 次连续空轮询后退出）
+- ✅ 大文件支持（>5GB 自动 256 并发 multipart copy）
+- ✅ 优雅的 Spot 中断处理（SIGTERM 捕获，消息返回队列）
 
-2. **京东云环境**
-   - Direct Connect 已建立
-   - 能够访问 AWS VPC 的网络连通性
+**成本**（每天 10 个文件，每次运行 2 分钟）：
+- Lambda Starter: ~$0.0001/月（128MB，60s 超时，每分钟 1 次）
+- Fargate Spot: ~$0.009/月（2 vCPU + 4GB，节省 70%）
+- SQS: 免费（每月前 100 万请求免费）
+- **总计**: <$0.01/月（**年成本 $0.11**，相比常驻模式节省 99.97%）
 
-3. **依赖工具**
-   - AWS CLI v2
-   - jq
-   - yq (mikefarah/yq)
-   - bash 4.0+
+## 快速开始
 
-## 安装步骤
-
-### 1. 安装依赖
+### 前置条件
 
 ```bash
-# Amazon Linux 2023
-sudo yum install -y aws-cli jq
-
-# 安装 yq
-sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
-sudo chmod +x /usr/bin/yq
+# 安装依赖
+aws configure  # 配置 AWS 凭证
+docker --version  # 确保 Docker 已安装
+jq --version  # 确保 jq 已安装
 ```
 
-### 2. 准备 S3 桶
+### 1. 创建 S3 桶
 
-**S3 Express One Zone 桶**（必须手动创建）：
 ```bash
-# Express 桶必须指定可用区，命名格式：bucket-name--azid--x-s3
+# 创建标准桶
 aws s3api create-bucket \
-  --bucket my-express-bucket--eun1-az1--x-s3 \
+  --bucket your-standard-bucket \
   --region eu-north-1 \
-  --create-bucket-configuration \
-    'Location={Type=AvailabilityZone,Name=eun1-az1},Bucket={Type=Directory,DataRedundancy=SingleAvailabilityZone}'
+  --create-bucket-configuration LocationConstraint=eu-north-1
+
+# 创建 S3 Express One Zone 桶
+aws s3api create-bucket \
+  --bucket your-express-bucket--eun1-az1--x-s3 \
+  --region eu-north-1 \
+  --create-bucket-configuration '{
+    "Location": {
+      "Type": "AvailabilityZone",
+      "Name": "eun1-az1"
+    },
+    "Bucket": {
+      "DataRedundancy": "SingleAvailabilityZone",
+      "Type": "Directory"
+    }
+  }'
 ```
 
-**S3 标准桶**（两种方式）：
-- **方式1**：使用已存在的桶，配置 `auto_create: false`
-- **方式2**：让脚本自动创建，配置 `auto_create: true`
-
-### 3. 配置
-
-复制配置文件并填入您的环境信息：
+### 2. 部署
 
 ```bash
-cp config.yaml.example config.yaml
-vim config.yaml
+# 编辑变量
+vi deploy.sh
+# 修改以下变量：
+# - REGION
+# - SRC_BUCKET
+# - DST_BUCKET
+# - PREFIX_FILTER（可选）
+
+# 执行部署
+./deploy.sh
 ```
 
-需要配置的关键参数：
-- `vpc_id`: VPC ID
-- `subnet_ids`: 私网子网 ID（至少 2 个）
-- `jd_cloud_cidr`: 京东云 CIDR 地址段
-- `standard_bucket.name`: 标准 S3 桶名称
-- `standard_bucket.auto_create`: `false`（使用已存在的桶）或 `true`（脚本自动创建）
-- `express_bucket.name`: Express 目录桶名称（完整格式，如 `my-bucket--eun1-az1--x-s3`）
+## 架构详解
 
-### 4. 运行设置
+```
+┌─────────────┐
+│ S3 标准桶    │ ObjectCreated/Removed 事件
+└──────┬──────┘
+       ↓
+┌──────────────┐
+│  SQS 队列    │ 消息缓冲 + 死信队列 (DLQ)
+└──────┬───────┘
+       ↑
+       │ (定时检查，每 1-5 分钟)
+       │
+┌──────────────────┐
+│ Lambda Starter   │ 轻量调度器 (128MB, 60s)
+│ EventBridge 定时 │ - 检查 SQS 队列深度
+│                  │ - 检查当前运行的 Worker 数
+│                  │ - 按需启动 Fargate Spot 任务
+└──────┬───────────┘
+       ↓ (启动 Worker)
+┌──────────────────┐
+│ Fargate Spot     │ Worker (2 vCPU + 4GB, ARM64)
+│ (80% Spot +      │ - 长轮询 SQS (20s)
+│  20% On-Demand)  │ - 处理 S3 事件 (copy/delete)
+│                  │ - 大文件 256 并发 multipart
+│                  │ - 3 次空轮询后自动退出
+│                  │ - SIGTERM 优雅关闭
+└──────┬───────────┘
+       ↓
+┌──────────────────┐
+│ S3 Express       │ 目标桶
+│ One Zone         │
+└──────────────────┘
+```
+
+### 工作流程
+
+1. **文件上传到标准桶** → S3 事件发送到 SQS 队列
+2. **Lambda Starter 定时检查**（每 1 分钟，可配置 1-5 分钟）：
+   - 获取 SQS 队列深度（visible + in-flight 消息）
+   - 获取当前运行 + 等待中的 Worker 数量
+   - 如果有消息且未达到 MAX_WORKERS → 启动新 Worker
+   - 启动策略：每 10 条消息启动 1 个 Worker（最多 MAX_WORKERS=2）
+3. **Fargate Spot Worker 处理**：
+   - 从 SQS 长轮询接收消息（20 秒等待）
+   - 解析 S3 事件（支持批量 Records）
+   - 执行操作：
+     - ObjectCreated → copy_to_dst（<5GB 单次，≥5GB 并发 multipart）
+     - ObjectRemoved → delete_from_dst
+   - 成功后删除 SQS 消息（Worker 负责消息删除）
+   - 失败 → 消息可见性超时后自动重试（最多 3 次，然后进 DLQ）
+4. **自动关闭机制**：
+   - Worker 连续 3 次空轮询（每次 20 秒长轮询）→ 约 1 分钟后自动退出
+   - Spot 中断（SIGTERM）→ 当前消息返回队列，优雅退出
+   - 新消息到达 → Lambda Starter 下次检查时启动新 Worker
+
+## 配置参数
+
+### 关键参数
 
 ```bash
-# 设置脚本执行权限
-chmod +x setup.sh scripts/*.sh
-
-# 完整安装（Phase 1 + Phase 2）
-./setup.sh all
-
-# 或分阶段安装
-./setup.sh phase1  # 仅 Phase 1
-./setup.sh phase2  # 仅 Phase 2
+# deploy.sh
+LAMBDA_POLL_RATE="1"                # Lambda 检查间隔（分钟，1-5 推荐）
+MAX_WORKERS=2                       # 最大并发 Worker 数
+EMPTY_POLLS_BEFORE_EXIT=3           # Worker 空轮询退出阈值
+VISIBILITY_TIMEOUT=7200             # SQS 可见性超时（2 小时，适合大文件）
+VISIBILITY_EXTEND_INTERVAL=300      # 处理期间每 5 分钟延长一次
+TASK_CPU="2048"                     # 每 Worker CPU（2 vCPU）
+TASK_MEMORY="4096"                  # 每 Worker 内存（4GB）
 ```
 
-## 使用方法
+### 成本优化
 
-### 完整设置
+**成本对比**（每天 10 个文件，假设每次运行 2 分钟）：
+
+| 方案 | 计算成本 | 触发成本 | 总月成本 | 年成本 | 节省比例 |
+|------|---------|---------|---------|--------|---------|
+| 常驻模式（2 workers）| $30.00 | $0 | $30.00 | $360 | - |
+| **Lambda + Fargate Spot** | **$0.009** | **$0.0001** | **$0.0091** | **$0.11** | **99.97%** |
+
+**详细定价**（eu-west-1，ARM64）：
+
+1. **Lambda Starter**（每分钟 1 次检查）：
+   - 请求：43,200 次/月（60 min × 24 hr × 30 天）
+   - 计算时间：~100ms/次 → 4,320 秒/月 = 0.55 GB-秒
+   - 成本：免费（每月 100 万请求 + 400,000 GB-秒免费额度）
+
+2. **Fargate Spot Worker**（2 vCPU + 4GB）：
+   - On-Demand: $0.04656/小时 → Spot: ~$0.014/小时（70% 节省）
+   - 每天 2 分钟 × 30 天 = 1 小时/月
+   - 成本：~$0.014/月
+
+3. **SQS**：
+   - 免费（每月前 100 万请求免费）
+
+**总计**：<$0.02/月（**年成本 $0.24**）
+
+### 调优建议
+
+| 场景 | LAMBDA_POLL_RATE | TASK_CPU/MEMORY | 月成本估算 |
+|------|------------------|-----------------|----------|
+| 低频率更新（每天 10 个文件）| 1 分钟 | 2048/4096 | $0.02 |
+| 中等频率（每天 50 个文件）| 1 分钟 | 2048/4096 | $0.10 |
+| 高频率（每天 200 个文件）| 1 分钟 | 4096/8192 | $0.50 |
+| 大文件（>10GB）| 1 分钟 | 4096/8192 | 按使用量 |
+
+### 进一步优化建议
+
+1. **调整 Lambda 检查频率**（降低响应延迟 vs 降低成本）：
 ```bash
-./setup.sh all
+# deploy.sh 中修改
+LAMBDA_POLL_RATE="5"  # 5 分钟检查一次（更省钱，适合非紧急场景）
+# 或
+LAMBDA_POLL_RATE="1"  # 1 分钟检查一次（默认，平衡响应速度和成本）
 ```
 
-### 分阶段设置
-
-**Phase 1**: 网络和 S3 Interface Endpoint
+2. **降低 CPU/内存配置**（小文件场景）：
 ```bash
-./setup.sh phase1
+# deploy.sh 中修改
+TASK_CPU="512"     # 0.5 vCPU
+TASK_MEMORY="1024" # 1GB
+# 再节省约 75%
 ```
 
-完成后需要手动配置：
-1. 在京东云 DNS 服务器配置 forwarder，将 `s3.eu-north-1.amazonaws.com` 查询转发到 Resolver IP
-2. 验证 DNS 解析：`nslookup s3.eu-north-1.amazonaws.com`
-3. 测试上传：`aws s3 cp testfile s3://your-bucket/incoming/`
-
-**Phase 2**: Lambda 同步到 S3 Express
+3. **增加并发 Worker**（高吞吐场景）：
 ```bash
-./setup.sh phase2
+# deploy.sh 中修改
+MAX_WORKERS=5  # 最多同时运行 5 个 Worker
+# Lambda Starter 会根据队列深度自动启动（每 10 条消息 1 个 Worker）
 ```
 
-### 验证配置
-```bash
-./setup.sh verify
-```
+4. **Fargate Spot 中断处理**：
+   - Spot 可能被中断（极少发生，通常 <5%）
+   - SIGTERM 信号捕获 → 优雅关闭，当前消息返回队列
+   - SQS 可见性超时会自动重试
+   - 80/20 混合策略自动降级到 On-Demand
+   - 无需额外配置
 
-验证内容：
-- S3 Interface Endpoint 状态
-- Route53 Resolver Endpoint 状态
-- Lambda 函数配置
-- S3 事件通知
-- IAM 角色和权限
-
-### 清理资源
-```bash
-./setup.sh cleanup
-```
-
-清理内容：
-- Lambda 函数及相关资源
-- S3 事件通知配置
-- IAM 角色和策略
-- S3 Interface Endpoint
-- Route53 Resolver Endpoint
-- 安全组
-
-注意：默认不删除 S3 桶，需要手动确认。
-
-## 目录结构
+## 文件结构
 
 ```
 s3sync/
-├── config.yaml                 # 配置文件
-├── setup.sh                    # 主设置脚本
-├── design.md                   # 设计文档
-├── README.md                   # 本文档
-├── scripts/
-│   ├── common.sh              # 公共函数
-│   ├── setup-phase1.sh        # Phase 1 设置脚本
-│   ├── setup-phase2.sh        # Phase 2 设置脚本
-│   ├── lambda_function.py     # Lambda 函数代码
-│   ├── verify.sh              # 验证脚本
-│   └── cleanup.sh             # 清理脚本
-├── phase1-output.json         # Phase 1 输出（自动生成）
-└── phase2-output.json         # Phase 2 输出（自动生成）
+├── deploy.sh                 # 完整部署脚本（Lambda + Fargate Spot）
+├── cleanup.sh                # 完整清理脚本
+├── Dockerfile                # Worker 容器镜像
+├── worker.py                 # Worker 主程序（SQS 轮询 + 自动关闭 + SIGTERM 处理）
+├── starter.py                # Lambda Starter 代码（队列检查 + 按需启动）
+├── requirements.txt          # Python 依赖（boto3[crt]）
+└── README.md                 # 本文档
 ```
 
-## 工作流程
+## 监控和管理
 
-### 上传流程
-1. 京东云主机上传文件到标准 S3 桶：
-   ```bash
-   aws s3 cp /path/to/file s3://your-bucket/incoming/ --region eu-north-1
-   ```
+### 查看日志
 
-2. S3 触发 Lambda 函数（ObjectCreated 事件）
-
-3. Lambda 自动将文件同步到 S3 Express 目录桶
-
-4. 查看同步结果：
-   ```bash
-   aws s3 ls s3://your-express-bucket/ingest/
-   ```
-
-### 监控和日志
-
-查看 Lambda 执行日志：
 ```bash
-aws logs tail /aws/lambda/s3-to-express-sync --follow --region eu-north-1
+# Lambda Starter 日志
+aws logs tail /aws/lambda/s3-to-s3express-sync-starter \
+  --follow --region eu-west-1
+
+# Fargate Worker 日志
+aws logs tail /ecs/s3-to-s3express-sync-task \
+  --follow --region eu-west-1
 ```
 
-查看最近的 Lambda 调用：
+### 查看运行状态
+
 ```bash
-aws lambda list-versions-by-function \
-  --function-name s3-to-express-sync \
-  --region eu-north-1
+# 查看 Lambda Starter 函数配置
+aws lambda get-function \
+  --function-name s3-to-s3express-sync-starter \
+  --region eu-west-1
+
+# 查看 EventBridge 定时规则
+aws events describe-rule \
+  --name s3-to-s3express-sync-starter-rule \
+  --region eu-west-1
+
+# 查看当前运行的 ECS Worker 任务
+aws ecs list-tasks \
+  --cluster s3-to-s3express-sync-cluster \
+  --desired-status RUNNING \
+  --region eu-west-1
+
+# 查看 SQS 队列深度
+QUEUE_URL=$(aws sqs get-queue-url \
+  --queue-name s3-to-s3express-sync-q \
+  --region eu-west-1 \
+  --query 'QueueUrl' --output text)
+
+aws sqs get-queue-attributes \
+  --queue-url "$QUEUE_URL" \
+  --attribute-names ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible \
+  --region eu-west-1
+
+# 查看死信队列（失败消息）
+aws sqs receive-message \
+  --queue-url $(aws sqs get-queue-url \
+    --queue-name s3-to-s3express-sync-dlq \
+    --region eu-west-1 \
+    --query 'QueueUrl' --output text) \
+  --max-number-of-messages 10 \
+  --region eu-west-1
 ```
 
-## 故障排查
+## 功能特性
 
-### S3 桶相关问题
+### ✅ 已实现
 
-**标准桶不存在错误**：
+- [x] 自动同步新增文件（ObjectCreated:*）
+- [x] 自动同步更新文件（覆盖写）
+- [x] 自动同步删除操作（ObjectRemoved:*）
+- [x] 大文件支持（≥5GB 自动 256 并发 multipart copy）
+- [x] 前缀过滤（可选）
+- [x] 幂等性保证（HeadObject 验证源文件存在）
+- [x] 自动重试（SQS 可见性超时 + DLQ）
+- [x] 按需启动/关闭（Lambda Starter + Worker 自动退出）
+- [x] 定时触发（EventBridge Schedule，1-5 分钟可配置）
+- [x] 成本优化（Fargate Spot 80/20 混合 + Lambda 免费额度）
+- [x] Spot 中断处理（SIGTERM 捕获，优雅关闭）
+- [x] 长时间运行保护（每 5 分钟自动延长可见性超时）
+
+### 核心组件功能
+
+**Lambda Starter** ([starter.py](starter.py)):
+```python
+1. 队列检查：
+   - 获取 SQS 队列深度（visible + in-flight）
+   - 获取当前运行的 Worker 数量
+
+2. 智能启动：
+   - 启动策略：每 10 条消息启动 1 个 Worker
+   - 最大并发控制：MAX_WORKERS=2（可配置）
+   - 容量保护：不超过最大 Worker 数
+
+3. Spot 优先：
+   - 80% Fargate Spot（base=0, weight=4）
+   - 20% Fargate On-Demand（base=0, weight=1）
 ```
-Bucket does not exist: my-standard-bucket
-Either create it manually or set 'auto_create: true' in config.yaml
+
+**Fargate Worker** ([worker.py](worker.py)):
+```python
+1. 智能复制：
+   - <5GB: 单次 CopyObject
+   - ≥5GB: 256 并发 multipart copy（64MB parts）
+   - 幂等性：HeadObject 验证源文件存在
+
+2. 自动关闭：
+   - 连续 3 次空轮询（每次 20 秒）→ 约 1 分钟后退出
+   - SIGTERM 捕获（Spot 中断）→ 消息返回队列
+
+3. 长时间运行保护：
+   - 每 5 分钟自动延长可见性超时（适合大文件）
+   - 默认可见性超时：2 小时
+
+4. 错误处理：
+   - 处理成功 → 删除 SQS 消息
+   - 处理失败 → 可见性超时后自动重试
+   - 重试 3 次失败 → 进入死信队列（DLQ）
 ```
-解决方法：
-- 手动创建桶，或
-- 修改 [config.yaml](config.yaml) 设置 `auto_create: true`
 
-**Express 桶不存在错误**：
+## 测试验证
+
+### 上传测试
+
+```bash
+echo "Test file" > test.txt
+aws s3 cp test.txt s3://your-standard-bucket/test.txt --region eu-west-1
+
+# 等待处理（最多 1-2 分钟）
+# 1. Lambda Starter 下次检查时（最多 1 分钟）
+# 2. Worker 启动并处理（约 30-60 秒）
+
+# 实时监控
+aws logs tail /aws/lambda/s3-to-s3express-sync-starter --follow --region eu-west-1 &
+aws logs tail /ecs/s3-to-s3express-sync-task --follow --region eu-west-1 &
+
+# 验证目标桶
+aws s3 ls s3://your-express-bucket--euw1-az1--x-s3/ --region eu-west-1
 ```
-S3 Express bucket does not exist: my-express-bucket--eun1-az1--x-s3
+
+### 删除测试
+
+```bash
+aws s3 rm s3://your-standard-bucket/test.txt --region eu-west-1
+
+# 等待处理（最多 1-2 分钟）
+# 验证已删除（命令应该失败）
+aws s3 ls s3://your-express-bucket--euw1-az1--x-s3/test.txt --region eu-west-1
 ```
-解决方法：
-- Express 桶必须手动创建（见上方准备步骤）
-- 确认桶名格式正确：`bucket-name--azid--x-s3`
 
-**Express 桶命名格式警告**：
+### 大文件测试（multipart copy）
+
+```bash
+# 创建 6GB 测试文件
+dd if=/dev/zero of=bigfile.bin bs=1M count=6144
+
+# 上传到标准桶
+aws s3 cp bigfile.bin s3://your-standard-bucket/bigfile.bin --region eu-west-1
+
+# 监控 Worker 日志（观察 multipart copy 进度）
+aws logs tail /ecs/s3-to-s3express-sync-task --follow --region eu-west-1
+# 应该看到：
+# "Using multipart copy for large file"
+# "Uploading 96 parts in parallel (max 256 concurrent)..."
+# "Progress: 20/96 parts (20%)"
 ```
-Warning: Bucket name doesn't match Express One Zone naming pattern
+
+## 故障排除
+
+### Lambda Starter 未启动 Worker
+
+**问题现象**：SQS 有消息，但没有 Worker 启动
+
+```bash
+# 1. 检查 Lambda Starter 是否正常运行
+aws lambda get-function \
+  --function-name s3-to-s3express-sync-starter \
+  --region eu-west-1
+
+# 2. 检查 Lambda 最近的调用日志
+aws logs tail /aws/lambda/s3-to-s3express-sync-starter \
+  --since 10m \
+  --region eu-west-1
+
+# 3. 检查 EventBridge 规则是否启用
+aws events describe-rule \
+  --name s3-to-s3express-sync-starter-rule \
+  --region eu-west-1 \
+  --query 'State'
+# 应该返回 "ENABLED"
+
+# 4. 手动触发 Lambda 测试
+aws lambda invoke \
+  --function-name s3-to-s3express-sync-starter \
+  --region eu-west-1 \
+  /tmp/lambda-output.json
+cat /tmp/lambda-output.json
 ```
-- 检查桶名是否符合格式：`name--azid--x-s3`
-- Express 桶必须包含可用区 ID，如 `eun1-az1`
 
-### DNS 解析失败
-- 检查 Route53 Resolver Endpoint 状态
-- 确认京东云 DNS forwarder 配置正确
-- 验证安全组允许 UDP/TCP 53 端口
+**常见原因**：
+- Lambda IAM 角色权限不足（无法 RunTask）
+- ECS 任务定义不存在或无效
+- 子网配置错误（无公网访问）
 
-### 上传失败
-- 检查 S3 Interface Endpoint 状态
-- 验证路由表配置
-- 确认 IAM 凭证有效
+### Worker 启动失败
 
-### Lambda 同步失败
-- 查看 CloudWatch Logs
-- 检查 Lambda IAM 角色权限
-- 确认 Lambda VPC 配置正确
-- 验证 S3 Express 桶存在且可访问
+```bash
+# 检查最近失败的 ECS 任务
+aws ecs list-tasks \
+  --cluster s3-to-s3express-sync-cluster \
+  --desired-status STOPPED \
+  --region eu-west-1
 
-### 网络连接问题
-- 确认 TGW 路由配置
-- 检查安全组规则（443/TCP）
-- 验证 VPC 子网路由表
+# 查看任务失败原因
+TASK_ARN=$(aws ecs list-tasks \
+  --cluster s3-to-s3express-sync-cluster \
+  --desired-status STOPPED \
+  --region eu-west-1 \
+  --query 'taskArns[0]' --output text)
+
+aws ecs describe-tasks \
+  --cluster s3-to-s3express-sync-cluster \
+  --tasks "$TASK_ARN" \
+  --region eu-west-1 \
+  --query 'tasks[0].stoppedReason'
+```
+
+**常见原因**：
+- ECR 镜像不存在或拉取失败
+- Task Role 权限不足（无法访问 S3/SQS）
+- 子网无公网访问（无法拉取 ECR 镜像）
+- CPU/内存配置不兼容
+
+### 文件未同步
+
+```bash
+# 1. 检查 SQS 队列深度
+QUEUE_URL=$(aws sqs get-queue-url \
+  --queue-name s3-to-s3express-sync-q \
+  --region eu-west-1 \
+  --query 'QueueUrl' --output text)
+
+aws sqs get-queue-attributes \
+  --queue-url "$QUEUE_URL" \
+  --attribute-names All \
+  --region eu-west-1
+
+# 2. 检查死信队列（DLQ）中的失败消息
+DLQ_URL=$(aws sqs get-queue-url \
+  --queue-name s3-to-s3express-sync-dlq \
+  --region eu-west-1 \
+  --query 'QueueUrl' --output text)
+
+aws sqs receive-message \
+  --queue-url "$DLQ_URL" \
+  --max-number-of-messages 10 \
+  --region eu-west-1
+
+# 3. 查看 Worker 日志中的错误
+aws logs tail /ecs/s3-to-s3express-sync-task \
+  --since 1h \
+  --region eu-west-1 | grep -i error
+```
+
+**常见原因**：
+- Task Role 权限不足（无法访问源桶或目标桶）
+- S3 Express 桶不存在或命名错误
+- 前缀过滤配置错误
+- 源文件已删除（幂等性处理）
+
+### 性能问题（处理缓慢）
+
+```bash
+# 检查当前运行的 Worker 数量
+aws ecs list-tasks \
+  --cluster s3-to-s3express-sync-cluster \
+  --desired-status RUNNING \
+  --region eu-west-1 | jq '.taskArns | length'
+
+# 检查队列积压
+aws sqs get-queue-attributes \
+  --queue-url "$QUEUE_URL" \
+  --attribute-names ApproximateNumberOfMessages \
+  --region eu-west-1
+```
+
+**解决方案**：
+- 增加 MAX_WORKERS（更多并发 Worker）
+- 降低 LAMBDA_POLL_RATE（更频繁检查）
+- 增加 TASK_CPU/MEMORY（更快处理）
+- 检查网络带宽限制
+
+## 清理资源
+
+```bash
+# 完整清理所有资源（Lambda + ECS + ECR + SQS + IAM，保留 S3 桶）
+./cleanup.sh
+
+# 手动删除 S3 桶（可选）
+aws s3 rb s3://your-standard-bucket --force --region eu-west-1
+aws s3 rb s3://your-express-bucket--euw1-az1--x-s3 --force --region eu-west-1
+```
+
+cleanup.sh 会删除：
+- Lambda Starter 函数
+- EventBridge 定时规则
+- ECS 集群、任务定义
+- ECR 仓库和镜像
+- SQS 队列（主队列 + DLQ）
+- IAM 角色和策略（Lambda Role + Task Role + Exec Role）
+- S3 VPC Endpoint（可选）
 
 ## 最佳实践
 
-1. **安全**
-   - 使用最小权限原则配置 IAM
-   - 定期轮换 AWS 凭证
-   - 启用 S3 桶版本控制
+### 1. 前缀过滤
 
-2. **性能**
-   - Lambda 和 Express 桶使用相同 AZ
-   - 合理设置 Lambda 内存和超时
-   - 考虑批量处理大量文件
-
-3. **成本优化**
-   - 定期清理测试文件
-   - 使用生命周期策略管理旧版本
-   - 监控数据传输成本
-
-4. **监控**
-   - 设置 CloudWatch 告警
-   - 监控 Lambda 错误率
-   - 跟踪 S3 请求指标
-
-## 高级配置
-
-### S3 桶配置选项
-
-**使用已存在的标准桶**：
-```yaml
-phase1:
-  standard_bucket:
-    name: your-existing-bucket
-    auto_create: false
-```
-
-**自动创建标准桶**：
-```yaml
-phase1:
-  standard_bucket:
-    name: new-bucket-name
-    auto_create: true
-```
-
-**Express 桶配置**：
-```yaml
-phase2:
-  express_bucket:
-    name: my-bucket--eun1-az1--x-s3  # 必须已存在
-    ingest_prefix: ingest/
-```
-
-### 修改 Lambda 运行时
-在 [config.yaml](config.yaml) 中修改：
-```yaml
-phase2:
-  lambda:
-    runtime: python3.12  # 或 python3.11, python3.10
-```
-
-### 自定义同步逻辑
-编辑 [scripts/lambda_function.py](scripts/lambda_function.py) 以实现：
-- 文件过滤
-- 路径转换
-- 元数据处理
-- 错误重试
-
-### 多区域部署
-为每个区域创建单独的配置文件：
 ```bash
-cp config.yaml config-eu-north-1.yaml
-cp config.yaml config-us-east-1.yaml
+# 只同步特定前缀（推荐用于大型桶）
+PREFIX_FILTER="models/"  # 只同步 models/ 下的文件
 ```
 
-## 参考文档
+### 2. 生命周期管理
 
-- [AWS S3 Interface Endpoints](https://docs.aws.amazon.com/AmazonS3/latest/userguide/privatelink-interface-endpoints.html)
-- [S3 Express One Zone](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-one-zone.html)
-- [Route 53 Resolver](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resolver.html)
-- [Lambda VPC Configuration](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html)
+如果源桶启用了 Lifecycle 过期删除，需额外监听：
+
+```json
+{
+  "Events": [
+    "s3:ObjectCreated:*",
+    "s3:ObjectRemoved:*",
+    "s3:LifecycleExpiration:*"
+  ]
+}
+```
+
+### 3. 版本控制
+
+如果源桶启用了 Versioning：
+- 当前配置已监听 `ObjectRemoved:*`（包含 DeleteMarkerCreated）
+- 建议使用 `ObjectRemoved:DeleteMarkerCreated` 精确匹配
+
+### 4. 安全建议
+
+- 使用 IAM 角色最小权限原则
+- 启用 S3 桶加密
+- 启用 CloudTrail 审计
+- 定期检查 DLQ 消息
+
+## 性能指标
+
+### 响应时间
+
+- **S3 → SQS 延迟**: <1 秒
+- **Lambda Starter 检查间隔**: 1 分钟（可配置 1-5 分钟）
+- **Worker 启动时间**: ~30-60 秒（冷启动，包含镜像拉取）
+- **文件同步延迟**: <5 秒（Worker 启动后，小文件）
+- **总端到端延迟**: ~1-2 分钟（从上传到同步完成）
+
+### 吞吐量
+
+**单个 Worker**（2 vCPU + 4GB）：
+
+| 文件大小 | 处理时间 | 吞吐量 | 备注 |
+|---------|---------|--------|------|
+| <1MB | <5s | >200 files/min | 单次 CopyObject |
+| 1-100MB | <30s | ~30 files/min | 单次 CopyObject |
+| 100MB-1GB | 1-5min | ~10 files/min | 单次 CopyObject |
+| 1-5GB | 2-10min | ~6 files/min | 单次 CopyObject |
+| >5GB | 256 并发 | ~500-1000 MB/s | Multipart copy，依网络带宽 |
+
+**多 Worker 并发**（MAX_WORKERS=2）：
+- 吞吐量线性扩展（2x）
+- 适合批量文件同步场景
+- Lambda Starter 自动根据队列深度启动 Worker
 
 ## 许可证
 
 MIT License
 
-## 支持
+## 贡献
 
-如有问题或建议，请提交 Issue。
+欢迎提交 Issue 和 Pull Request。
+
+## 参考资料
+
+- [S3 Express One Zone 文档](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-one-zone.html)
+- [S3 Event Notifications](https://docs.aws.amazon.com/AmazonS3/latest/userguide/NotificationHowTo.html)
+- [Amazon SQS 文档](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/welcome.html)
+- [AWS Lambda 文档](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html)
+- [EventBridge Scheduler](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-create-rule-schedule.html)
+- [ECS Fargate 定价](https://aws.amazon.com/fargate/pricing/)
+- [Fargate Spot](https://aws.amazon.com/blogs/compute/deep-dive-into-fargate-spot-to-run-your-ecs-tasks-for-up-to-70-less/)
+- [S3 Multipart Upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html)
