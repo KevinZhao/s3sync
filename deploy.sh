@@ -325,7 +325,14 @@ EOF
     --tags Key=Project,Value="$STACK_TAG" \
     --query 'Role.Arn' --output text)
 
-  cat > /tmp/task-policy.json <<EOF
+  echo "Task role created: $TASK_ROLE_ARN"
+else
+  echo "Task role already exists: $TASK_ROLE_ARN"
+fi
+
+# Always update task role policy (even if role exists) to reflect current bucket names
+echo "Updating task role policy..."
+cat > /tmp/task-policy.json <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -370,15 +377,10 @@ EOF
 }
 EOF
 
-  aws iam put-role-policy \
-    --role-name "$TASK_ROLE_NAME" \
-    --policy-name "${TASK_ROLE_NAME}-inline" \
-    --policy-document file:///tmp/task-policy.json
-
-  echo "Task role created: $TASK_ROLE_ARN"
-else
-  echo "Task role already exists: $TASK_ROLE_ARN"
-fi
+aws iam put-role-policy \
+  --role-name "$TASK_ROLE_NAME" \
+  --policy-name "${TASK_ROLE_NAME}-inline" \
+  --policy-document file:///tmp/task-policy.json
 
 # Execution Role (for ECR and CloudWatch Logs)
 set +e
@@ -565,7 +567,7 @@ fi
 ############################################
 # 7) Create Lambda Starter IAM Role
 ############################################
-echo "Creating Lambda Starter IAM role..."
+echo "Checking/Creating Lambda Starter IAM role..."
 
 cat > /tmp/lambda-trust.json <<'EOF'
 {
@@ -589,6 +591,8 @@ LAMBDA_ROLE_ARN=$(aws iam create-role \
   --query 'Role.Arn' --output text 2>/dev/null || \
   aws iam get-role --role-name "$LAMBDA_ROLE_NAME" --query 'Role.Arn' --output text)
 
+# Always update Lambda role policy to reflect current resources
+echo "Updating Lambda Starter role policy..."
 cat > /tmp/lambda-policy.json <<EOF
 {
   "Version": "2012-10-17",
