@@ -4,13 +4,30 @@ set -euo pipefail
 ############################################
 # Lambda Starter + Fargate Spot Worker Deployment
 # Reliable on-demand architecture: Starter checks queue, Worker owns message deletion
+#
+# Usage:
+#   Basic (creates new buckets):
+#     ./deploy.sh
+#
+#   Use existing buckets:
+#     REGION=eu-west-1 SRC_BUCKET=my-source-bucket DST_BUCKET=my-express-bucket ./deploy.sh
+#
+#   Use existing Express bucket with full name:
+#     DST_BUCKET=my-express--euw1-az1--x-s3 ./deploy.sh
+#
+#   Set prefix filter:
+#     PREFIX_FILTER="deepseek-v3.2/" ./deploy.sh
 ############################################
-REGION="eu-west-1"
 
+# Configuration: Set via environment variables or use defaults
+REGION="${REGION:-eu-north-1}"
+
+# Bucket names: use provided names or create new ones with timestamp
 TIMESTAMP=$(date +%s)
-SRC_BUCKET="s3sync-standard-ireland-${TIMESTAMP}"
-DST_BUCKET="s3sync-express-ireland-${TIMESTAMP}--euw1-az1--x-s3"
-PREFIX_FILTER=""
+SRC_BUCKET="${SRC_BUCKET:-s3sync-standard-${TIMESTAMP}}"
+# S3 Express One Zone bucket - suffix will be auto-generated based on AZ if not provided
+DST_BUCKET="${DST_BUCKET:-s3sync-express-${TIMESTAMP}}"
+PREFIX_FILTER="${PREFIX_FILTER:-}"
 
 STACK_TAG="s3-to-s3express-sync"
 APP_NAME="s3-to-s3express-sync"
@@ -63,14 +80,25 @@ else
 fi
 
 # Create S3 Express One Zone bucket
-if ! aws s3api head-bucket --bucket "$DST_BUCKET" --region "$REGION" 2>/dev/null; then
-  echo "Creating S3 Express One Zone bucket: $DST_BUCKET"
-  # Get availability zone ID (not name)
-  AZ_ID=$(aws ec2 describe-availability-zones --region "$REGION" --query 'AvailabilityZones[0].ZoneId' --output text)
-  echo "Using Availability Zone: $AZ_ID"
+# Get availability zone ID first to construct full bucket name
+AZ_ID=$(aws ec2 describe-availability-zones --region "$REGION" --query 'AvailabilityZones[0].ZoneId' --output text)
+echo "Using Availability Zone: $AZ_ID"
+
+# Check if DST_BUCKET already has the full S3 Express format (ends with --x-s3)
+if [[ "$DST_BUCKET" == *"--x-s3" ]]; then
+  # User provided full Express bucket name
+  DST_BUCKET_FULL="$DST_BUCKET"
+  echo "Using existing S3 Express bucket name: $DST_BUCKET_FULL"
+else
+  # Construct full S3 Express bucket name with AZ suffix
+  DST_BUCKET_FULL="${DST_BUCKET}--${AZ_ID}--x-s3"
+fi
+
+if ! aws s3api head-bucket --bucket "$DST_BUCKET_FULL" --region "$REGION" 2>/dev/null; then
+  echo "Creating S3 Express One Zone bucket: $DST_BUCKET_FULL"
 
   aws s3api create-bucket \
-    --bucket "$DST_BUCKET" \
+    --bucket "$DST_BUCKET_FULL" \
     --region "$REGION" \
     --create-bucket-configuration "{
       \"Location\": {
@@ -82,10 +110,13 @@ if ! aws s3api head-bucket --bucket "$DST_BUCKET" --region "$REGION" 2>/dev/null
         \"Type\": \"Directory\"
       }
     }"
-  echo "S3 Express bucket created: s3://$DST_BUCKET"
+  echo "S3 Express bucket created: s3://$DST_BUCKET_FULL"
 else
-  echo "S3 Express bucket already exists: s3://$DST_BUCKET"
+  echo "S3 Express bucket already exists: s3://$DST_BUCKET_FULL"
 fi
+
+# Update DST_BUCKET to use full name for rest of script
+DST_BUCKET="$DST_BUCKET_FULL"
 
 ############################################
 # 1) Create or get existing SQS queue
@@ -566,7 +597,8 @@ cat > /tmp/lambda-policy.json <<EOF
       "Sid": "SqsRead",
       "Effect": "Allow",
       "Action": [
-        "sqs:GetQueueAttributes"
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl"
       ],
       "Resource": "${MAIN_ARN}"
     },
@@ -575,7 +607,8 @@ cat > /tmp/lambda-policy.json <<EOF
       "Effect": "Allow",
       "Action": [
         "ecs:RunTask",
-        "ecs:ListTasks"
+        "ecs:ListTasks",
+        "ecs:DescribeTasks"
       ],
       "Resource": "*"
     },
@@ -649,7 +682,7 @@ def handler(event, context):
     if running_tasks >= MAX_WORKERS:
         return {"statusCode": 200, "body": f"At capacity: {running_tasks}/{MAX_WORKERS}"}
 
-    tasks_needed = min(MAX_WORKERS - running_tasks, max(1, (queue_depth + 9) // 10))
+    tasks_needed = min(MAX_WORKERS - running_tasks, queue_depth)
 
     started = []
     for i in range(tasks_needed):
