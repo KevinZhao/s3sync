@@ -47,14 +47,14 @@ EMPTY_POLLS_BEFORE_EXIT=3           # Exit after 3 consecutive empty polls
 VISIBILITY_EXTEND_INTERVAL=300      # Extend visibility every 5 minutes
 
 # Lambda Starter Settings
-LAMBDA_POLL_RATE="1"  # minutes between checks (1-5 recommended)
+LAMBDA_POLL_RATE="1"  # minutes between checks (EventBridge minimum is 1 minute)
 LAMBDA_NAME="${APP_NAME}-starter"
 LAMBDA_ROLE_NAME="${LAMBDA_NAME}-role"
 MAX_WORKERS="${MAX_WORKERS:-64}"  # Default 64 (reduced from 128), can override via env var
 
 # Scaling strategy to avoid burst and smooth S3 request spikes
 TARGET_BACKLOG_PER_TASK="${TARGET_BACKLOG_PER_TASK:-3}"  # Each task handles N messages
-BURST_START_LIMIT="${BURST_START_LIMIT:-10}"             # Max tasks to start per poll
+BURST_START_LIMIT="${BURST_START_LIMIT:-20}"             # Max tasks to start per poll (increased for faster ramp-up)
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
@@ -118,6 +118,30 @@ if ! aws s3api head-bucket --bucket "$DST_BUCKET_FULL" --region "$REGION" 2>/dev
 else
   echo "S3 Express bucket already exists: s3://$DST_BUCKET_FULL"
 fi
+
+# Configure lifecycle policy to clean up incomplete multipart uploads
+echo "Configuring S3 lifecycle policy for multipart upload cleanup..."
+cat > /tmp/lifecycle-policy.json <<'EOF'
+{
+  "Rules": [
+    {
+      "ID": "CleanupIncompleteMultipartUploads",
+      "Status": "Enabled",
+      "Filter": {},
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 7
+      }
+    }
+  ]
+}
+EOF
+
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "$DST_BUCKET_FULL" \
+  --lifecycle-configuration file:///tmp/lifecycle-policy.json \
+  --region "$REGION"
+
+echo "Lifecycle policy configured: incomplete multipart uploads will be cleaned after 7 days"
 
 # Update DST_BUCKET to use full name for rest of script
 DST_BUCKET="$DST_BUCKET_FULL"
@@ -799,5 +823,65 @@ echo ""
 echo "Monitor:"
 echo "  Lambda: aws logs tail /aws/lambda/${LAMBDA_NAME} --follow --region ${REGION}"
 echo "  Worker: aws logs tail /ecs/${TASK_FAMILY} --follow --region ${REGION}"
+echo ""
+
+# Verify deployment
+echo "============================================"
+echo "Verifying deployment..."
+echo "============================================"
+
+# Check SQS queue
+QUEUE_MSG_COUNT=$(aws sqs get-queue-attributes \
+  --region "$REGION" \
+  --queue-url "$MAIN_URL" \
+  --attribute-names ApproximateNumberOfMessages \
+  --query 'Attributes.ApproximateNumberOfMessages' \
+  --output text)
+echo "✓ SQS Queue: $QUEUE_MSG_COUNT messages waiting"
+
+# Check Lambda function
+LAMBDA_STATE=$(aws lambda get-function \
+  --region "$REGION" \
+  --function-name "$LAMBDA_NAME" \
+  --query 'Configuration.State' \
+  --output text)
+echo "✓ Lambda Function: $LAMBDA_STATE"
+
+# Check EventBridge rule
+RULE_STATE=$(aws events describe-rule \
+  --region "$REGION" \
+  --name "$RULE_NAME" \
+  --query 'State' \
+  --output text)
+echo "✓ EventBridge Rule: $RULE_STATE (triggers every ${LAMBDA_POLL_RATE} min)"
+
+# Check S3 event notification
+NOTIF_COUNT=$(aws s3api get-bucket-notification-configuration \
+  --region "$REGION" \
+  --bucket "$SRC_BUCKET" \
+  --query 'length(QueueConfigurations)' \
+  --output text)
+echo "✓ S3 Event Notification: $NOTIF_COUNT configuration(s) active"
+
+# Check ECS cluster
+CLUSTER_STATUS=$(aws ecs describe-clusters \
+  --region "$REGION" \
+  --clusters "$CLUSTER_NAME" \
+  --query 'clusters[0].status' \
+  --output text)
+RUNNING_TASKS=$(aws ecs list-tasks \
+  --region "$REGION" \
+  --cluster "$CLUSTER_NAME" \
+  --query 'length(taskArns)' \
+  --output text)
+echo "✓ ECS Cluster: $CLUSTER_STATUS ($RUNNING_TASKS tasks running)"
+
+echo ""
+if [ "$QUEUE_MSG_COUNT" -gt 0 ]; then
+  echo "⚠️  Note: There are $QUEUE_MSG_COUNT messages in the queue."
+  echo "   Lambda will process them on next trigger (within ${LAMBDA_POLL_RATE} min)"
+  echo "   or run manually: aws lambda invoke --region $REGION --function-name $LAMBDA_NAME /tmp/lambda-out.json"
+fi
+
 echo ""
 echo "Test: Upload a file and watch the logs!"
