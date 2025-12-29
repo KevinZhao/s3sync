@@ -736,6 +736,11 @@ else
     --function-name "$LAMBDA_NAME" \
     --zip-file fileb:///tmp/starter.zip >/dev/null
 
+  echo "Waiting for Lambda code update to complete..."
+  aws lambda wait function-updated \
+    --region "$REGION" \
+    --function-name "$LAMBDA_NAME"
+
   aws lambda update-function-configuration \
     --region "$REGION" \
     --function-name "$LAMBDA_NAME" \
