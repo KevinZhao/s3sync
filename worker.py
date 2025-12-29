@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 import json
+import logging
 import os
 import signal
 import sys
 import time
 import urllib.parse
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+# Enable botocore retry logging
+logging.basicConfig(level=logging.INFO)
+boto3.set_stream_logger('botocore.retries', logging.INFO)
+boto3.set_stream_logger('botocore.endpoint', logging.INFO)
 
 REGION = os.environ["REGION"]
 SRC_BUCKET = os.environ["SRC_BUCKET"]
@@ -26,23 +32,23 @@ s3 = boto3.client(
     "s3",
     region_name=REGION,
     config=Config(
-        max_pool_connections=50,  # Increased for higher concurrency
+        max_pool_connections=100,  # 16 threads × 6 connections + buffer for retries/head/complete
         s3={
             "addressing_style": "virtual",
             "use_accelerate_endpoint": False,
             "payload_signing_enabled": True
         },
-        connect_timeout=10,
-        read_timeout=900,  # 15 minutes for large parts
+        connect_timeout=30,        # Increased from 10s
+        read_timeout=1800,         # Increased to 30 minutes for large parts
         retries={
-            "max_attempts": 5,
-            "mode": "adaptive"
+            "max_attempts": 10,    # Increased from 5 to 10
+            "mode": "standard"     # Changed from adaptive to standard (more aggressive)
         }
     )
 )
 sqs = boto3.client("sqs", region_name=REGION)
 
-FIVE_GB = 5 * 1024**3
+FIVE_HUNDRED_MB = 500 * 1024**2
 shutdown_flag = False
 
 def log(msg: str):
@@ -79,24 +85,45 @@ def copy_to_dst(key: str, receipt_handle: str):
     try:
         # Verify source object exists (idempotency check)
         try:
-            head = s3.head_object(Bucket=SRC_BUCKET, Key=key)
+            src_head = s3.head_object(Bucket=SRC_BUCKET, Key=key)
         except ClientError as e:
             if e.response['Error']['Code'] == '404':
                 log(f"  ⚠️  Source object not found (may have been deleted): {key}")
                 return True  # Treat as success - idempotent
             raise
 
-        size = head.get("ContentLength", 0)
-        log(f"  Size: {size:,} bytes ({size / (1024**3):.2f} GB)")
+        src_size = src_head.get("ContentLength", 0)
+        src_etag = src_head.get("ETag", "")
+        log(f"  Size: {src_size:,} bytes ({src_size / (1024**3):.2f} GB)")
+
+        # Check if destination already has identical object (idempotency)
+        try:
+            dst_head = s3.head_object(Bucket=DST_BUCKET, Key=key)
+            dst_size = dst_head.get("ContentLength", 0)
+            dst_etag = dst_head.get("ETag", "")
+
+            if dst_size == src_size and dst_etag == src_etag:
+                log(f"  ✅ Destination already has identical object (size={dst_size}, etag={dst_etag}) - skipping")
+                return True
+            else:
+                log(f"  ⚠️  Destination has different object (size: {dst_size} vs {src_size}, etag: {dst_etag} vs {src_etag}) - overwriting")
+        except ClientError as e:
+            if e.response['Error']['Code'] != '404':
+                raise
+            # Destination doesn't exist, proceed with copy
+            log(f"  Destination object not found - proceeding with copy")
+
+        size = src_size
 
         copy_source = {"Bucket": SRC_BUCKET, "Key": key}
         last_extend = time.time()
 
-        if size >= FIVE_GB:
-            log(f"  Using multipart copy for large file")
+        # Use multipart for files >= 500MB for better performance and reliability
+        if size >= FIVE_HUNDRED_MB:
+            log(f"  Using multipart copy (>= 500MB)")
             _multipart_copy(copy_source, DST_BUCKET, key, receipt_handle, last_extend)
         else:
-            # For smaller files, just extend once before copy
+            # For files < 500MB, use copy_object
             if time.time() - last_extend > VISIBILITY_EXTEND_INTERVAL:
                 extend_visibility(receipt_handle)
             s3.copy_object(CopySource=copy_source, Bucket=DST_BUCKET, Key=key)
@@ -131,7 +158,7 @@ def _multipart_copy(copy_source, dest_bucket, dest_key, receipt_handle, last_ext
     try:
         head = s3.head_object(**copy_source)
         size = head["ContentLength"]
-        part_size = 64 * 1024 * 1024  # 64MB for testing with higher concurrency
+        part_size = 64 * 1024 * 1024  # 64MB - smaller parts for better network reliability
 
         # Calculate all parts upfront
         part_jobs = []
@@ -146,7 +173,7 @@ def _multipart_copy(copy_source, dest_bucket, dest_key, receipt_handle, last_ext
 
         # Upload parts in parallel
         parts = []
-        max_workers = 256  # 256 concurrent uploads for maximum throughput (~5.5 Gbps)
+        max_workers = 16  # Increased to 16 for better performance with large files
 
         log(f"  Uploading {len(part_jobs)} parts in parallel (max {max_workers} concurrent)...")
 
@@ -157,9 +184,13 @@ def _multipart_copy(copy_source, dest_bucket, dest_key, receipt_handle, last_ext
                 for pn, br, start, end in part_jobs
             }
 
+            pending = set(future_to_part.keys())
             completed = 0
-            for future in as_completed(future_to_part):
-                part_num, start, end = future_to_part[future]
+            last_progress_time = time.time()
+
+            while pending:
+                # Wait up to 60s for any future to complete (watchdog timeout)
+                done, pending = wait(pending, timeout=60, return_when=FIRST_COMPLETED)
 
                 # Check for shutdown signal
                 if shutdown_flag:
@@ -173,15 +204,32 @@ def _multipart_copy(copy_source, dest_bucket, dest_key, receipt_handle, last_ext
                     extend_visibility(receipt_handle)
                     last_extend = time.time()
 
-                try:
-                    part_result = future.result()
-                    parts.append(part_result)
-                    completed += 1
-                    if completed % 5 == 0 or completed == len(part_jobs):
-                        log(f"    Progress: {completed}/{len(part_jobs)} parts ({completed*100//len(part_jobs)}%)")
-                except Exception as e:
-                    log(f"  ❌ Part {part_num} failed: {e}")
-                    raise
+                # If timeout with no completion, log watchdog status
+                if not done:
+                    elapsed = time.time() - last_progress_time
+                    in_flight = len(pending)
+                    log(f"    Watchdog: {completed}/{len(part_jobs)} completed, {in_flight} in-flight "
+                        f"({elapsed:.0f}s no completion)")
+                    continue
+
+                # Process completed futures
+                for future in done:
+                    part_num, start, end = future_to_part[future]
+                    try:
+                        part_result = future.result()
+                        parts.append(part_result)
+                        completed += 1
+
+                        # Progress logging
+                        elapsed_since_progress = time.time() - last_progress_time
+                        if completed % 5 == 0 or completed == len(part_jobs):
+                            log(f"    Progress: {completed}/{len(part_jobs)} parts ({completed*100//len(part_jobs)}%) "
+                                f"[{elapsed_since_progress:.1f}s since last batch]")
+                            last_progress_time = time.time()
+
+                    except Exception as e:
+                        log(f"  ❌ Part {part_num} failed: {e}")
+                        raise
 
         # Sort parts by part number before completing
         parts.sort(key=lambda x: x["PartNumber"])

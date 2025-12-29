@@ -4,6 +4,7 @@ Starter Lambda - checks SQS queue and starts ECS Fargate Spot tasks on-demand
 Triggered by EventBridge every 1-5 minutes
 """
 import os
+import math
 import boto3
 
 REGION = os.environ["REGION"]
@@ -13,6 +14,10 @@ TASK_DEFINITION = os.environ["TASK_DEFINITION"]
 SUBNETS = os.environ["SUBNETS"].split(",")  # Comma-separated subnet IDs
 SECURITY_GROUPS = os.environ.get("SECURITY_GROUPS", "").split(",") if os.environ.get("SECURITY_GROUPS") else []
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
+
+# Backlog-per-task scaling strategy to avoid burst and smooth S3 request spikes
+TARGET_BACKLOG_PER_TASK = int(os.environ.get("TARGET_BACKLOG_PER_TASK", "3"))
+BURST_START_LIMIT = int(os.environ.get("BURST_START_LIMIT", "10"))
 
 sqs = boto3.client("sqs", region_name=REGION)
 ecs = boto3.client("ecs", region_name=REGION)
@@ -26,7 +31,8 @@ def get_queue_depth():
     attrs = resp["Attributes"]
     visible = int(attrs.get("ApproximateNumberOfMessages", 0))
     not_visible = int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0))
-    return visible + not_visible
+    total = visible + not_visible
+    return visible, not_visible, total
 
 def get_running_tasks():
     """Get count of running + pending tasks"""
@@ -78,11 +84,12 @@ def handler(event, context):
     """Lambda handler - check queue and start tasks as needed"""
     print(f"Checking queue: {QUEUE_URL}")
 
-    queue_depth = get_queue_depth()
+    visible, not_visible, queue_depth = get_queue_depth()
     running_tasks = get_running_tasks()
 
-    print(f"Queue depth: {queue_depth} messages")
+    print(f"Queue: {visible} visible, {not_visible} in-flight, {queue_depth} total")
     print(f"Running tasks: {running_tasks}/{MAX_WORKERS}")
+    print(f"Scaling strategy: TARGET_BACKLOG_PER_TASK={TARGET_BACKLOG_PER_TASK}, BURST_START_LIMIT={BURST_START_LIMIT}")
 
     if queue_depth == 0:
         print("No messages in queue - no action needed")
@@ -98,14 +105,20 @@ def handler(event, context):
             "body": f"At max capacity: {running_tasks}/{MAX_WORKERS}"
         }
 
-    # Calculate how many tasks to start
-    # Simple heuristic: 1 task per 10 messages (or remaining capacity)
+    # Calculate how many tasks to start using backlog-per-task strategy
+    # This avoids burst and smooths S3 request spikes
+    desired_tasks = math.ceil(queue_depth / TARGET_BACKLOG_PER_TASK)
+    tasks_needed = max(0, desired_tasks - running_tasks)
+
+    # Apply burst limit to avoid sudden spikes (gradual ramp-up)
     tasks_needed = min(
+        tasks_needed,
         MAX_WORKERS - running_tasks,
-        max(1, (queue_depth + 9) // 10)  # Round up, min 1
+        BURST_START_LIMIT
     )
 
-    print(f"Starting {tasks_needed} task(s)...")
+    print(f"Backlog calculation: {queue_depth} messages ÷ {TARGET_BACKLOG_PER_TASK} per task = {desired_tasks} desired tasks")
+    print(f"Starting {tasks_needed} task(s) (burst limit: {BURST_START_LIMIT})...")
 
     started = []
     for i in range(tasks_needed):

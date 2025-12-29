@@ -40,9 +40,9 @@ TASK_FAMILY="${APP_NAME}-task"
 TASK_ROLE_NAME="${APP_NAME}-task-role"
 EXEC_ROLE_NAME="${APP_NAME}-exec-role"
 ECR_REPO_NAME="${APP_NAME}"
-TASK_CPU="2048"                     # 2 vCPU for 64 concurrent threads + 5 Gbps bandwidth
-TASK_MEMORY="4096"                  # 4GB for boto3[crt] + 50 connection pool + 64 threads
-VISIBILITY_TIMEOUT=7200             # 2 hours for large files
+TASK_CPU="1024"                     # 1 vCPU (reduced from 2 vCPU)
+TASK_MEMORY="2048"                  # 2GB (reduced from 4GB)
+VISIBILITY_TIMEOUT=1800             # 30 minutes (sufficient for large files with extend interval)
 EMPTY_POLLS_BEFORE_EXIT=3           # Exit after 3 consecutive empty polls
 VISIBILITY_EXTEND_INTERVAL=300      # Extend visibility every 5 minutes
 
@@ -50,7 +50,11 @@ VISIBILITY_EXTEND_INTERVAL=300      # Extend visibility every 5 minutes
 LAMBDA_POLL_RATE="1"  # minutes between checks (1-5 recommended)
 LAMBDA_NAME="${APP_NAME}-starter"
 LAMBDA_ROLE_NAME="${LAMBDA_NAME}-role"
-MAX_WORKERS=5
+MAX_WORKERS="${MAX_WORKERS:-64}"  # Default 64 (reduced from 128), can override via env var
+
+# Scaling strategy to avoid burst and smooth S3 request spikes
+TARGET_BACKLOG_PER_TASK="${TARGET_BACKLOG_PER_TASK:-3}"  # Each task handles N messages
+BURST_START_LIMIT="${BURST_START_LIMIT:-10}"             # Max tasks to start per poll
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
@@ -183,6 +187,9 @@ cat > /tmp/sqs-policy.json <<EOF
       "Action": "sqs:SendMessage",
       "Resource": "${MAIN_ARN}",
       "Condition": {
+        "StringEquals": {
+          "aws:SourceAccount": "${ACCOUNT_ID}"
+        },
         "ArnLike": {
           "aws:SourceArn": "arn:aws:s3:::${SRC_BUCKET}"
         }
@@ -206,7 +213,28 @@ aws sqs set-queue-attributes \
 
 # Configure S3 event notification
 echo "Configuring S3 event notification..."
-cat > /tmp/s3-notification.json <<EOF
+if [ -n "$PREFIX_FILTER" ]; then
+  echo "  Using prefix filter: $PREFIX_FILTER"
+  cat > /tmp/s3-notification.json <<EOF
+{
+  "QueueConfigurations": [
+    {
+      "QueueArn": "${MAIN_ARN}",
+      "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            {"Name": "prefix", "Value": "${PREFIX_FILTER}"}
+          ]
+        }
+      }
+    }
+  ]
+}
+EOF
+else
+  echo "  No prefix filter (monitoring all objects)"
+  cat > /tmp/s3-notification.json <<EOF
 {
   "QueueConfigurations": [
     {
@@ -216,6 +244,7 @@ cat > /tmp/s3-notification.json <<EOF
   ]
 }
 EOF
+fi
 
 aws s3api put-bucket-notification-configuration \
   --bucket "$SRC_BUCKET" \
@@ -532,9 +561,9 @@ fi
 echo "Using subnets: $SUBNET_IDS"
 
 ############################################
-# 6.5) Create S3 VPC Endpoint (if not exists)
+# 6.5) Create S3 VPC Endpoints (if not exist)
 ############################################
-echo "Checking/Creating S3 VPC Endpoint..."
+echo "Checking/Creating S3 VPC Endpoints..."
 
 # Get route tables
 ROUTE_TABLES=$(aws ec2 describe-route-tables \
@@ -543,26 +572,29 @@ ROUTE_TABLES=$(aws ec2 describe-route-tables \
   --query 'RouteTables[*].RouteTableId' \
   --output text)
 
-# Check if S3 VPC Endpoint already exists
-EXISTING_ENDPOINT=$(aws ec2 describe-vpc-endpoints \
+# Check if S3 Standard VPC Endpoint already exists
+EXISTING_S3_ENDPOINT=$(aws ec2 describe-vpc-endpoints \
   --region "$REGION" \
   --filters "Name=vpc-id,Values=$VPC_ID" "Name=service-name,Values=com.amazonaws.$REGION.s3" \
   --query 'VpcEndpoints[0].VpcEndpointId' \
   --output text 2>/dev/null || echo "None")
 
-if [ "$EXISTING_ENDPOINT" != "None" ] && [ -n "$EXISTING_ENDPOINT" ]; then
-  echo "S3 VPC Endpoint already exists: $EXISTING_ENDPOINT"
+if [ "$EXISTING_S3_ENDPOINT" != "None" ] && [ -n "$EXISTING_S3_ENDPOINT" ]; then
+  echo "S3 Standard VPC Endpoint already exists: $EXISTING_S3_ENDPOINT"
 else
-  echo "Creating S3 VPC Endpoint (Gateway type)..."
-  ENDPOINT_ID=$(aws ec2 create-vpc-endpoint \
+  echo "Creating S3 Standard VPC Endpoint (Gateway type)..."
+  S3_ENDPOINT_ID=$(aws ec2 create-vpc-endpoint \
     --region "$REGION" \
     --vpc-id "$VPC_ID" \
     --service-name "com.amazonaws.$REGION.s3" \
     --route-table-ids $ROUTE_TABLES \
     --query 'VpcEndpoint.VpcEndpointId' \
     --output text)
-  echo "S3 VPC Endpoint created: $ENDPOINT_ID"
+  echo "S3 Standard VPC Endpoint created: $S3_ENDPOINT_ID"
 fi
+
+# Note: S3 Express One Zone uses the standard S3 Gateway VPC Endpoint (com.amazonaws.$REGION.s3)
+# No separate s3express endpoint is needed (per AWS documentation)
 
 ############################################
 # 7) Create Lambda Starter IAM Role
@@ -652,71 +684,15 @@ sleep 10
 ############################################
 echo "Creating Lambda Starter function..."
 
-# Create deployment package
+# Create deployment package from starter.py
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd /tmp
 rm -f starter.zip
-cat > /tmp/starter-lambda.py <<'EOPY'
-import os, boto3
 
-REGION = os.environ["REGION"]
-QUEUE_URL = os.environ["QUEUE_URL"]
-CLUSTER = os.environ["CLUSTER"]
-TASK_DEFINITION = os.environ["TASK_DEFINITION"]
-SUBNETS = os.environ["SUBNETS"].split(",")
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
+# Copy starter.py and rename for Lambda handler
+cp "${SCRIPT_DIR}/starter.py" /tmp/starter.py
 
-sqs = boto3.client("sqs", region_name=REGION)
-ecs = boto3.client("ecs", region_name=REGION)
-
-def handler(event, context):
-    attrs = sqs.get_queue_attributes(
-        QueueUrl=QUEUE_URL,
-        AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"]
-    )["Attributes"]
-    queue_depth = int(attrs.get("ApproximateNumberOfMessages", 0)) + int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0))
-
-    running = len(ecs.list_tasks(cluster=CLUSTER, desiredStatus="RUNNING").get("taskArns", []))
-    pending = len(ecs.list_tasks(cluster=CLUSTER, desiredStatus="PENDING").get("taskArns", []))
-    running_tasks = running + pending
-
-    print(f"Queue: {queue_depth} messages, Tasks: {running_tasks}/{MAX_WORKERS}")
-
-    if queue_depth == 0:
-        return {"statusCode": 200, "body": "No messages"}
-    if running_tasks >= MAX_WORKERS:
-        return {"statusCode": 200, "body": f"At capacity: {running_tasks}/{MAX_WORKERS}"}
-
-    tasks_needed = min(MAX_WORKERS - running_tasks, queue_depth)
-
-    started = []
-    for i in range(tasks_needed):
-        try:
-            resp = ecs.run_task(
-                cluster=CLUSTER,
-                taskDefinition=TASK_DEFINITION,
-                capacityProviderStrategy=[
-                    {"capacityProvider": "FARGATE_SPOT", "weight": 4, "base": 0},
-                    {"capacityProvider": "FARGATE", "weight": 1, "base": 0}
-                ],
-                networkConfiguration={
-                    "awsvpcConfiguration": {
-                        "subnets": SUBNETS,
-                        "assignPublicIp": "ENABLED"
-                    }
-                },
-                count=1
-            )
-            if resp.get("tasks"):
-                started.append(resp["tasks"][0]["taskArn"])
-                print(f"  Started: {resp['tasks'][0]['taskArn'].split('/')[-1]}")
-        except Exception as e:
-            print(f"  Failed: {e}")
-            break
-
-    return {"statusCode": 200, "body": f"Started {len(started)} tasks", "tasksStarted": len(started)}
-EOPY
-
-zip -q starter.zip starter-lambda.py
+zip -q starter.zip starter.py
 cd - >/dev/null
 
 # Create or update Lambda
@@ -733,7 +709,9 @@ cat > /tmp/lambda-env.json <<EOF
     "CLUSTER": "${CLUSTER_NAME}",
     "TASK_DEFINITION": "${TASK_DEF_ARN}",
     "SUBNETS": "${SUBNET_IDS}",
-    "MAX_WORKERS": "${MAX_WORKERS}"
+    "MAX_WORKERS": "${MAX_WORKERS}",
+    "TARGET_BACKLOG_PER_TASK": "${TARGET_BACKLOG_PER_TASK}",
+    "BURST_START_LIMIT": "${BURST_START_LIMIT}"
   }
 }
 EOF
@@ -745,7 +723,7 @@ if [ $LAMBDA_EXISTS -ne 0 ]; then
     --function-name "$LAMBDA_NAME" \
     --runtime python3.12 \
     --role "$LAMBDA_ROLE_ARN" \
-    --handler starter-lambda.handler \
+    --handler starter.handler \
     --zip-file fileb:///tmp/starter.zip \
     --timeout 60 \
     --memory-size 128 \
