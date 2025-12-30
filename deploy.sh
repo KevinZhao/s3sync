@@ -281,13 +281,21 @@ echo "SQS Queue: $MAIN_ARN"
 ############################################
 echo "Checking/Creating ECS cluster..."
 
-# Create ECS cluster if not exists
+# Check if cluster exists and get its status
 set +e
-aws ecs describe-clusters --region "$REGION" --clusters "$CLUSTER_NAME" --query 'clusters[0].clusterName' --output text 2>/dev/null | grep -q "$CLUSTER_NAME"
+CLUSTER_STATUS=$(aws ecs describe-clusters --region "$REGION" --clusters "$CLUSTER_NAME" --query 'clusters[0].status' --output text 2>/dev/null)
 CLUSTER_EXISTS=$?
 set -e
 
-if [ $CLUSTER_EXISTS -ne 0 ]; then
+# If cluster exists but is INACTIVE, delete and recreate it
+if [ $CLUSTER_EXISTS -eq 0 ] && [ "$CLUSTER_STATUS" = "INACTIVE" ]; then
+  echo "⚠️  Cluster exists but is INACTIVE, recreating..."
+  aws ecs delete-cluster --region "$REGION" --cluster "$CLUSTER_NAME" >/dev/null 2>&1 || true
+  sleep 3
+  CLUSTER_EXISTS=1  # Force recreation
+fi
+
+if [ $CLUSTER_EXISTS -ne 0 ] || [ "$CLUSTER_STATUS" = "INACTIVE" ]; then
   echo "Creating ECS cluster: $CLUSTER_NAME"
   aws ecs create-cluster \
     --region "$REGION" \
@@ -295,9 +303,9 @@ if [ $CLUSTER_EXISTS -ne 0 ]; then
     --capacity-providers FARGATE FARGATE_SPOT \
     --default-capacity-provider-strategy capacityProvider=FARGATE_SPOT,weight=1 \
     --tags key=Project,value="$STACK_TAG" >/dev/null
-  echo "ECS cluster created"
+  echo "ECS cluster created: ACTIVE"
 else
-  echo "ECS cluster already exists: $CLUSTER_NAME"
+  echo "ECS cluster already exists: $CLUSTER_NAME (status: $CLUSTER_STATUS)"
   # Ensure cluster has Fargate Spot capacity provider
   aws ecs put-cluster-capacity-providers \
     --cluster "$CLUSTER_NAME" \
@@ -479,6 +487,11 @@ EOF
   echo "Execution role created: $EXEC_ROLE_ARN"
 else
   echo "Execution role already exists: $EXEC_ROLE_ARN"
+
+  # Ensure execution role policy is attached (in case role was created externally)
+  aws iam attach-role-policy \
+    --role-name "$EXEC_ROLE_NAME" \
+    --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" 2>/dev/null || true
 
   # Ensure logs policy exists on existing role
   cat > /tmp/exec-logs-policy.json <<'EOF'
